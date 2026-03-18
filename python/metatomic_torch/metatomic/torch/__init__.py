@@ -53,6 +53,7 @@ from .model import (  # noqa: F401
     is_atomistic_model,
     load_atomistic_model,
 )
+from .dftd3 import DFTD3  # noqa: F401
 from .serialization import (  # noqa: F401
     load_system,
     load_system_buffer,
