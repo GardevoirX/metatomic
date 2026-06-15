@@ -210,15 +210,22 @@ class HeatFlux(torch.nn.Module):
     for semilocal machine-learning potentials. (2023). Physical Review B, 108, L100302.`
     """
 
-    def __init__(self, model: AtomisticModel):
+    def __init__(self, model: AtomisticModel, use_jvp: bool = False):
         """
         :param model: the :py:class:`AtomisticModel` to wrap, which should be able to
             compute atomic energies and their gradients with respect to positions
+        :param use_jvp: if ``True``, compute the barycenter term of the potential heat
+            flux with a forward-mode Jacobian-vector product (:func:`torch.func.jvp`)
+            instead of looping over the three Cartesian components. This is faster but
+            not TorchScript-compatible, so it only works when the wrapped model is used
+            directly in Python. A saved/scripted model falls back to the Cartesian-loop
+            implementation, which gives identical results.
         """
         super().__init__()
 
         assert isinstance(model, AtomisticModel)
         self._model = model.module
+        self._use_jvp = use_jvp
         self._interaction_range = model.capabilities().interaction_range
         if model.capabilities().length_unit.lower() not in ["angstrom", "a"]:
             raise NotImplementedError(
@@ -328,7 +335,7 @@ class HeatFlux(torch.nn.Module):
         return results
 
     @staticmethod
-    def wrap(model: AtomisticModel) -> AtomisticModel:
+    def wrap(model: AtomisticModel, use_jvp: bool = False) -> AtomisticModel:
         """
         Wrap an existing model able to compute atomic energies (i.e. model with a
         per-atom ``"energy"`` output, or any energy variants like ``"energy/pbe"``),
@@ -343,8 +350,10 @@ class HeatFlux(torch.nn.Module):
         ``"heat_flux/pbe"`` output (using the ``"energy/pbe"`` output).
 
         :param model: the :py:class:`AtomisticModel` to wrap
+        :param use_jvp: see :py:meth:`HeatFlux.__init__`. Only takes effect when the
+            returned model is used directly in Python (not saved/scripted).
         """
-        wrapper = HeatFlux(model)
+        wrapper = HeatFlux(model, use_jvp=use_jvp)
         capabilities = model.capabilities()
         outputs = {
             key: capabilities.outputs[key]
@@ -421,6 +430,124 @@ class HeatFlux(torch.nn.Module):
 
         return results
 
+    @torch.jit.unused
+    def _jvp_energy_terms(
+        self,
+        unfolded_system: System,
+        energy_variants: List[str],
+        velocities: torch.Tensor,
+        n_atoms: int,
+    ) -> tuple[
+        Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]
+    ]:
+        """
+        Compute ``term1`` with true forward-mode AD while keeping the neighbor topology
+        fixed. The neighbor pairs and cell shifts are computed once outside the
+        transform; inside :func:`torch.func.jvp`, the differentiable neighbor distances
+        are rebuilt from the current positions with tensor indexing.
+        """
+        outputs = {
+            "energy" + variant: self._wrapped_outputs["energy" + variant]
+            for variant in energy_variants
+        }
+
+        neighbor_lists = []
+        for option, nl_calculator in zip(
+            self._requested_neighbor_lists, self._nl_calculators, strict=True
+        ):
+            neighbors = nl_calculator.compute(unfolded_system)
+            neighbor_lists.append((option, neighbors))
+
+        device = unfolded_system.device
+        selected_atoms = Labels(
+            ["system", "atom"],
+            torch.vstack(
+                [
+                    torch.zeros(
+                        len(unfolded_system.positions),
+                        device=device,
+                        dtype=torch.int32,
+                    ),
+                    torch.arange(
+                        len(unfolded_system.positions),
+                        device=device,
+                        dtype=torch.int32,
+                    ),
+                ]
+            ).T,
+            assume_unique=True,
+        )
+
+        def energy_terms(
+            positions: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            local_system = System(
+                types=unfolded_system.types,
+                positions=positions,
+                cell=unfolded_system.cell,
+                pbc=unfolded_system.pbc,
+            )
+            for option, neighbors in neighbor_lists:
+                samples = neighbors.samples
+                sample_values = samples.values
+                first = sample_values[:, 0].to(torch.long)
+                second = sample_values[:, 1].to(torch.long)
+                shifts = sample_values[:, 2:5].to(positions.dtype)
+                distances = (
+                    positions[second]
+                    - positions[first]
+                    + shifts @ unfolded_system.cell
+                )
+                local_system.add_neighbor_list(
+                    option,
+                    TensorBlock(
+                        distances.reshape(-1, 3, 1),
+                        samples=samples,
+                        components=neighbors.components,
+                        properties=neighbors.properties,
+                    ),
+                )
+            energy_outputs = self._model([local_system], outputs, selected_atoms)
+
+            # detached positions: the JVP must only differentiate through the atomic
+            # energies, exactly like the barycenter in the default path
+            r_aux = positions.detach()
+            barycenters: List[torch.Tensor] = []
+            atomic_energies: List[torch.Tensor] = []
+            total_energies: List[torch.Tensor] = []
+            for variant in energy_variants:
+                block = energy_outputs["energy" + variant].block()
+                order = torch.argsort(block.samples.column("atom").to(torch.long))
+                atomic_e = block.values.flatten()[order]
+                total_e = atomic_e[:n_atoms].sum()
+                barycenter = (atomic_e[:n_atoms, None] * r_aux[:n_atoms]).sum(dim=0)
+                barycenters.append(barycenter)
+                atomic_energies.append(atomic_e)
+                total_energies.append(total_e)
+            return (
+                torch.stack(barycenters),
+                torch.stack(atomic_energies),
+                torch.stack(total_energies),
+            )
+
+        primal, tangent = torch.func.jvp(
+            energy_terms,
+            (unfolded_system.positions,),
+            (velocities,),
+        )
+        _, atomic_e_primal, total_e_primal = primal
+        barycenter_tangent = tangent[0]
+
+        term1s: Dict[str, torch.Tensor] = {}
+        atomic_es: Dict[str, torch.Tensor] = {}
+        total_es: Dict[str, torch.Tensor] = {}
+        for i, variant in enumerate(energy_variants):
+            # term1 carries no useful graph (matching the default path's term1)
+            term1s[variant] = barycenter_tangent[i].detach()
+            atomic_es[variant] = atomic_e_primal[i]
+            total_es[variant] = total_e_primal[i]
+        return term1s, atomic_es, total_es
+
     def _calc_unfolded_heat_flux(
         self, system: System, energy_variants: List[str]
     ) -> Dict[str, torch.Tensor]:
@@ -429,11 +556,6 @@ class HeatFlux(torch.nn.Module):
             system.device
         )
         unfolded_system.positions.requires_grad_(True)
-        for option, nl_calculator in zip(
-            self._requested_neighbor_lists, self._nl_calculators, strict=True
-        ):
-            neighbors = nl_calculator.compute(unfolded_system)
-            unfolded_system.add_neighbor_list(option, neighbors)
 
         velocities: torch.Tensor = (
             unfolded_system.get_data("velocity").block().values.reshape(-1, 3)
@@ -442,27 +564,50 @@ class HeatFlux(torch.nn.Module):
             unfolded_system.get_data("mass").block().values.reshape(-1)
         )
 
-        results: Dict[str, torch.Tensor] = {}
+        # the barycenter term (``term1``) and the atomic/total energies, obtained from
+        # either a fused JVP (a single model evaluation, eager-mode only) or the
+        # default path (one evaluation plus one backward pass per Cartesian component)
+        term1s: Dict[str, torch.Tensor] = {}
+        atomic_es: Dict[str, torch.Tensor] = {}
+        total_es: Dict[str, torch.Tensor] = {}
 
-        barycenter_and_atomic_energies = self._barycenter_and_atomic_energies(
-            unfolded_system, n_atoms, energy_variants
-        )
-
-        for variant in energy_variants:
-            barycenter, atomic_e, total_e = barycenter_and_atomic_energies[variant]
-
-            term1 = torch.zeros(
-                (3), device=system.positions.device, dtype=system.positions.dtype
+        if self._use_jvp and not torch.jit.is_scripting():
+            term1s, atomic_es, total_es = self._jvp_energy_terms(
+                unfolded_system, energy_variants, velocities, n_atoms
             )
-            for i in range(3):
-                grad_i = torch.autograd.grad(
-                    [barycenter[i]],
-                    [unfolded_system.positions],
-                    retain_graph=True,
-                    create_graph=False,
-                )[0]
-                grad_i = torch.jit._unwrap_optional(grad_i)
-                term1[i] = (grad_i * velocities).sum()
+        else:
+            for option, nl_calculator in zip(
+                self._requested_neighbor_lists, self._nl_calculators, strict=True
+            ):
+                neighbors = nl_calculator.compute(unfolded_system)
+                unfolded_system.add_neighbor_list(option, neighbors)
+
+            barycenter_and_atomic_energies = self._barycenter_and_atomic_energies(
+                unfolded_system, n_atoms, energy_variants
+            )
+            for variant in energy_variants:
+                barycenter, atomic_e, total_e = barycenter_and_atomic_energies[variant]
+                term1 = torch.zeros(
+                    (3), device=system.positions.device, dtype=system.positions.dtype
+                )
+                for i in range(3):
+                    grad_i = torch.autograd.grad(
+                        [barycenter[i]],
+                        [unfolded_system.positions],
+                        retain_graph=True,
+                        create_graph=False,
+                    )[0]
+                    grad_i = torch.jit._unwrap_optional(grad_i)
+                    term1[i] = (grad_i * velocities).sum()
+                term1s[variant] = term1
+                atomic_es[variant] = atomic_e
+                total_es[variant] = total_e
+
+        results: Dict[str, torch.Tensor] = {}
+        for variant in energy_variants:
+            term1 = term1s[variant]
+            atomic_e = atomic_es[variant]
+            total_e = total_es[variant]
 
             go = torch.jit.annotate(
                 Optional[List[Optional[torch.Tensor]]], [torch.ones_like(total_e)]

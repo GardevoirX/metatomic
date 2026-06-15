@@ -152,6 +152,73 @@ def test_heat_flux(model, script, system, variant, expected):
     )
 
 
+@pytest.mark.parametrize(
+    "system, variant, expected",
+    [
+        ("system", "/doubled", [[9.0147e-05], [-2.6166e-04], [-1.9002e-04]]),
+        ("system", "", [[8.8238e-05], [-2.5559e-04], [-2.0570e-04]]),
+        ("system_triclinic", "/doubled", [[1.0979e-04], [-2.7677e-04], [-1.7868e-04]]),
+        ("system_triclinic", "", [[9.8061e-05], [-2.6314e-04], [-2.0004e-04]]),
+    ],
+    indirect=["system"],
+)
+def test_heat_flux_jvp(model, system, variant, expected, monkeypatch):
+    # ``use_jvp=True`` computes the barycenter term of the potential heat flux with a
+    # true forward-mode JVP instead of looping over the three Cartesian components.
+    calls = 0
+    original_jvp = torch.func.jvp
+
+    def counted_jvp(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_jvp(*args, **kwargs)
+
+    monkeypatch.setattr(torch.func, "jvp", counted_jvp)
+    heat_flux_model = HeatFlux.wrap(model, use_jvp=True)
+
+    evaluation_options = ModelEvaluationOptions(
+        length_unit="Angstrom",
+        outputs={
+            "heat_flux" + variant: ModelOutput(unit="eV*A/fs", sample_kind="system")
+        },
+    )
+
+    results = heat_flux_model([system], evaluation_options, check_consistency=True)
+
+    heat_flux = results["heat_flux" + variant].block().values
+    assert calls == 1
+    assert torch.allclose(
+        heat_flux,
+        torch.tensor(expected, dtype=heat_flux.dtype),
+    )
+
+
+def test_heat_flux_jvp_scripts_and_falls_back(model, system, monkeypatch):
+    # A ``use_jvp=True`` model must still be scriptable: the JVP code path is skipped
+    # under TorchScript (``torch.jit.is_scripting()`` guard), falling back to the
+    # Cartesian-loop implementation, which produces an identical result.
+    heat_flux_model = HeatFlux.wrap(model, use_jvp=True)
+
+    evaluation_options = ModelEvaluationOptions(
+        length_unit="Angstrom",
+        outputs={"heat_flux": ModelOutput(unit="eV*A/fs", sample_kind="system")},
+    )
+
+    eager = heat_flux_model([system], evaluation_options, check_consistency=True)
+
+    def forbidden_jvp(*args, **kwargs):
+        raise AssertionError("scripted heat flux should fall back instead of using JVP")
+
+    monkeypatch.setattr(torch.func, "jvp", forbidden_jvp)
+    scripted = torch.jit.script(heat_flux_model)
+    scripted_results = scripted([system], evaluation_options, check_consistency=True)
+
+    assert torch.allclose(
+        eager["heat_flux"].block().values,
+        scripted_results["heat_flux"].block().values,
+    )
+
+
 def test_multiple_outputs(model, system):
     heat_flux_model = HeatFlux.wrap(model)
 
